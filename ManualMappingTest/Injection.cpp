@@ -103,14 +103,52 @@ bool ManualMap(HANDLE hProc, const char * szDllFile)
 			{
 				printf("Can't map sections! 0x%x\n", GetLastError());
 				delete[] pSrcData;
-				VirtualFreeEx(hProc, pTargetBase, pOldOptHeader->SizeOfImage, MEM_RELEASE);
+				VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
 				return false;
 			}
 		}
 	}
 
+	memcpy(pSrcData, &data, sizeof(data));
+	//write pData to beginning of module
+	WriteProcessMemory(hProc, pTargetBase, pSrcData, 0x1000, nullptr);
+
 	//We can now delete the source data
 	delete[] pSrcData;
+
+	//Allocate some memory for shellcode
+	void * pShellcode = VirtualAllocEx(hProc, nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	if(!pShellcode)
+	{
+		printf("Memory allocation failed (ex): 0x%X\n", GetLastError());
+		VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
+		return false;
+	}
+
+	WriteProcessMemory(hProc, pShellcode, Shellcode, 0x1000, nullptr);
+
+	//Create new thread
+	HANDLE hThread = CreateRemoteThread(hProc, nullptr, 0, reinterpret_cast<PTHREAD_START_ROUTINE>(pShellcode), pTargetBase, 0, nullptr);
+	if(!hThread)
+	{
+		printf("Thread creation failed: 0x%X\n", GetLastError());
+		VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
+		VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
+		return false;
+	}
+
+	CloseHandle(hThread);
+
+	HINSTANCE hCheck = NULL;
+	while(!hCheck)
+	{
+		MANUAL_MAPPING_DATA data_checked{ 0 };
+		ReadProcessMemory(hProc, pTargetBase, &data_checked, sizeof(data_checked), nullptr);
+		hCheck = data_checked.hMod;
+		Sleep(10);
+	}
+	VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
+	return true;
 }
 
 #define RELOC_FLAG32(RelInfo) ((RelInfo >> 0x0C) == IMAGE_REL_BASED_HIGHLOW)
@@ -156,4 +194,50 @@ void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData)
 			pRelocData = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<BYTE*>(pRelocData) + pRelocData->SizeOfBlock);
 		}
 	}
+
+	//Import section
+	if(pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size)
+	{
+		auto * pImportDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(pBase + pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+		while (pImportDesc->Name)
+		{
+			char * szMod = reinterpret_cast<char*>(pBase + pImportDesc->Name);
+			HINSTANCE hDll = _LoadLibraryA(szMod);
+			ULONG_PTR * pThunkRef = reinterpret_cast<ULONG_PTR*>(pBase + pImportDesc->OriginalFirstThunk);
+			ULONG_PTR * pFuncRef = reinterpret_cast<ULONG_PTR*>(pBase + pImportDesc->FirstThunk);
+
+			if (!pThunkRef)
+				pThunkRef = pFuncRef;
+
+			for (; *pThunkRef; ++pThunkRef, ++pFuncRef)
+			{
+				if(IMAGE_SNAP_BY_ORDINAL(*pThunkRef))
+				{
+					*pFuncRef = _GetProcAddress(hDll, reinterpret_cast<char*>(*pThunkRef & 0xFFFF));
+				}
+				else
+				{
+					auto * pImport = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(pBase + (*pThunkRef));
+					*pFuncRef = _GetProcAddress(hDll, pImport->Name);
+				}
+			}
+			++pImportDesc;
+		}
+	}
+	//Call the local storage callbacks
+	if(pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size)
+	{
+		auto * pTLS = reinterpret_cast<IMAGE_TLS_DIRECTORY*>(pBase + pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
+		auto * pCallback = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(pTLS->AddressOfCallBacks);
+		for(; pCallback && *pCallback; ++pCallback) //while pCallback and *pCallback actually point to a callback
+		{
+			(*pCallback)(pBase, DLL_PROCESS_ATTACH, nullptr);
+		}
+	}
+
+	//Call dllmain
+	_DllMain(pBase, DLL_PROCESS_ATTACH, nullptr);
+
+	//Check if injection succeeded
+	pData->hMod = reinterpret_cast<HINSTANCE>(pBase);
 }
