@@ -112,6 +112,17 @@ bool ManualMap(HANDLE hProc, const char * szDllFile)
 	//We can now delete the source data
 	delete[] pSrcData;
 }
+
+#define RELOC_FLAG32(RelInfo) ((RelInfo >> 0x0C) == IMAGE_REL_BASED_HIGHLOW)
+#define RELOC_FLAG64(RelInfo) ((RelInfo >> 0x0C) == IMAGE_REL_BASED_DIR64)
+
+#ifdef _WIN64
+#define RELOC_FLAG RELOC_FLAG64
+#else
+#define RELOC_FLAG RELOC_FLAG32
+#endif
+
+//Relocation Process
 void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData)
 {
 	if (!pData)
@@ -132,7 +143,17 @@ void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData)
 		auto * pRelocData = reinterpret_cast<IMAGE_BASE_RELOCATION*>(pBase + pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
 		while (pRelocData->VirtualAddress)
 		{
-			
+			UINT AmountOfEntries = (pRelocData->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+			WORD * pRelativeInfo = reinterpret_cast<WORD*>(pRelocData + 1);
+			for(UINT i = 0; i != AmountOfEntries; ++i, ++pRelativeInfo)
+			{
+				if(RELOC_FLAG(*pRelativeInfo))
+				{
+					UINT_PTR * pPatch = reinterpret_cast<UINT_PTR*>(pBase + pRelocData->VirtualAddress + ((*pRelativeInfo) & 0xFFF));
+					*pPatch += reinterpret_cast<UINT_PTR>(LocationDelta);
+				}
+			}
+			pRelocData = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<BYTE*>(pRelocData) + pRelocData->SizeOfBlock);
 		}
 	}
 }
