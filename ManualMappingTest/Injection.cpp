@@ -10,20 +10,24 @@ bool ManualMap(HANDLE hProc, const char * szDllFile)
 	IMAGE_FILE_HEADER * pOldFileHeader = nullptr;
 	BYTE * pTargetBase = nullptr;
 
-	if(!GetFileAttributesA(szDllFile) == INVALID_FILE_ATTRIBUTES)
+	//Check if file actually exists
+	if(!GetFileAttributesA(szDllFile))// == INVALID_FILE_ATTRIBUTES)
 	{
 		printf("file doesn't exist\n");
 		return false;
 	}
 
+	//Open file
 	std::ifstream File(szDllFile, std::ios::binary | std::ios::ate);
 	if(File.fail())
 	{
 		printf("Opening the file failed: %X\n", (DWORD)File.rdstate());
+		File.close();
 		return false;
 	}
 
-	auto FileSize = File.tellg();
+	//Get filesize (if < 4kb: fail)
+	auto FileSize = File.tellg(); //Note: tellg set filepointer to end of file
 	if(FileSize < 0x1000)
 	{
 		printf("Filesize is invalid.\n");
@@ -48,14 +52,15 @@ bool ManualMap(HANDLE hProc, const char * szDllFile)
 	File.close();
 
 	//Check if file is dll
-	if(reinterpret_cast<IMAGE_DOS_HEADER*>(pSrcData)->e_magic != 0x5A4D) //"MZ"
+	if(reinterpret_cast<IMAGE_DOS_HEADER*>(pSrcData)->e_magic != 0x5A4D) //"MZ", valid PE file = 0x5A4D
 	{
 		printf("Invalid file\n");
 		delete[] pSrcData;
 		return false;
 	}
 
-	pOldNtHeader = reinterpret_cast<IMAGE_NT_HEADERS*>(pSrcData + reinterpret_cast<IMAGE_DOS_HEADER*>(pSrcData)->e_lfanew);
+	//Fill headers
+	pOldNtHeader = reinterpret_cast<IMAGE_NT_HEADERS*>(pSrcData + reinterpret_cast<IMAGE_DOS_HEADER*>(pSrcData)->e_lfanew); //e_lfanew is new NT header
 	pOldOptHeader = &pOldNtHeader->OptionalHeader;
 	pOldFileHeader = &pOldNtHeader->FileHeader;
 
@@ -80,10 +85,11 @@ bool ManualMap(HANDLE hProc, const char * szDllFile)
 	pTargetBase = reinterpret_cast<BYTE*>(VirtualAllocEx(hProc, reinterpret_cast<void*>(pOldOptHeader->ImageBase), pOldOptHeader->SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
 	if(!pTargetBase)
 	{
+		//Can't allocate memory at imageBase -> path a nullptr
 		pTargetBase = reinterpret_cast<BYTE*>(VirtualAllocEx(hProc, nullptr, pOldOptHeader->SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
 		if(!pTargetBase)
 		{
-			printf("Memory allocating failed (ex) 0x%X\n", GetLastError());
+			printf("Memory allocating failed (ex) 0x%X\n", GetLastError()); //not enough RAM or anticheat protection
 			delete[] pSrcData;
 			return false;
 		}
@@ -94,11 +100,15 @@ bool ManualMap(HANDLE hProc, const char * szDllFile)
 	data.pLoadLibraryA = LoadLibraryA;
 	data.pGetProcAddress = reinterpret_cast<f_GetProcAddress>(GetProcAddress);
 
+	//Start mapping the sections
 	auto * pSectionHeader = IMAGE_FIRST_SECTION(pOldNtHeader);
 	for(UINT i = 0; i != pOldFileHeader->NumberOfSections; ++i, ++pSectionHeader)
 	{
-		if(pSectionHeader->SizeOfRawData)
+		if(pSectionHeader->SizeOfRawData)//only copy data initialized at start aka not 0
 		{
+			//write to pTargetBase + relative offset to section
+			//source = previously read sourcedata + rawdata offset
+			//size = sizeofrawdata
 			if(!WriteProcessMemory(hProc, pTargetBase + pSectionHeader->VirtualAddress, pSrcData + pSectionHeader->PointerToRawData, pSectionHeader->SizeOfRawData, nullptr))
 			{
 				printf("Can't map sections! 0x%x\n", GetLastError());
