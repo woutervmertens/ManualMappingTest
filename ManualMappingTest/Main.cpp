@@ -1,6 +1,9 @@
 #include "Injection.h"
-
-const char szDllFile[] = "C:\\Users\\woute\\Source\\repos\\TestDllCommand\\Release\\TestDllCommand.dll";
+#ifdef _WIN64
+const char szDllFile[] = "C:\\Users\\woute\\Source\\repos\\ManualMappingTest\\TestDllCommandx64.dll";
+#else
+const char szDllFile[] = "C:\\Users\\woute\\Source\\repos\\ManualMappingTest\\TestDllCommandx86.dll";
+#endif
 const char szProc[] = "ManualMappingTest.exe";
 
 /**
