@@ -1,7 +1,7 @@
 #include "Injection.h"
 
-const char szDllFile[] = "C:\\Users\\woute\\Source\\repos\\ManualMappingTest\\ManualMappingTest\\Test.dll";
-const char szProc[] = "Test Console.exe";
+const char szDllFile[] = "C:\\Users\\woute\\Source\\repos\\TestDllCommand\\Release\\TestDllCommand.dll";
+const char szProc[] = "ManualMappingTest.exe";
 
 /**
  * Manual mapping workflow:
@@ -67,5 +67,7 @@ int main()
 
 	//Close processhandle and return
 	CloseHandle(hProc);
+
+	std::cin.get();
 	return 0;
 }

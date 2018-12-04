@@ -119,6 +119,7 @@ bool ManualMap(HANDLE hProc, const char * szDllFile)
 		}
 	}
 
+	//Copy PE header in target process
 	memcpy(pSrcData, &data, sizeof(data));
 	//write pData to beginning of module
 	WriteProcessMemory(hProc, pTargetBase, pSrcData, 0x1000, nullptr);
@@ -126,6 +127,7 @@ bool ManualMap(HANDLE hProc, const char * szDllFile)
 	//We can now delete the source data
 	delete[] pSrcData;
 
+	//================Write shellcode into memory================
 	//Allocate some memory for shellcode
 	void * pShellcode = VirtualAllocEx(hProc, nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 	if(!pShellcode)
@@ -135,6 +137,7 @@ bool ManualMap(HANDLE hProc, const char * szDllFile)
 		return false;
 	}
 
+	//Copy shellcode into target process
 	WriteProcessMemory(hProc, pShellcode, Shellcode, 0x1000, nullptr);
 
 	//Create new thread
@@ -149,6 +152,7 @@ bool ManualMap(HANDLE hProc, const char * szDllFile)
 
 	CloseHandle(hThread);
 
+	//Check if it works and if shellcode is finished
 	HINSTANCE hCheck = NULL;
 	while(!hCheck)
 	{
@@ -157,47 +161,61 @@ bool ManualMap(HANDLE hProc, const char * szDllFile)
 		hCheck = data_checked.hMod;
 		Sleep(10);
 	}
+	//Deallocate shellcode memory
 	VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
 	return true;
 }
 
+//MACRO to check if RelativeInfo counts a flag we care about aka is relocation necessary or not
 #define RELOC_FLAG32(RelInfo) ((RelInfo >> 0x0C) == IMAGE_REL_BASED_HIGHLOW)
 #define RELOC_FLAG64(RelInfo) ((RelInfo >> 0x0C) == IMAGE_REL_BASED_DIR64)
 
+//Change MACRO according to OS
 #ifdef _WIN64
 #define RELOC_FLAG RELOC_FLAG64
 #else
 #define RELOC_FLAG RELOC_FLAG32
 #endif
 
-//Relocation Process
+//================Relocation Process================
 void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData)
 {
 	if (!pData)
 		return;
+	//This code will get injected, during injection we can't call any functions 
+	//-> pass all the function we need here to the pData struct
+	//-> from the struct we can then grab the pointers, otherwise we'd have to relocate the shellcode
 
+	//Declare some variables
 	BYTE * pBase = reinterpret_cast<BYTE*>(pData);
 	auto * pOpt = &reinterpret_cast<IMAGE_NT_HEADERS*>(pBase + reinterpret_cast<IMAGE_DOS_HEADER*>(pData)->e_lfanew)->OptionalHeader;
 
+	//Function prototypes
 	auto _LoadLibraryA = pData->pLoadLibraryA;
 	auto _GetProcAddress = pData->pGetProcAddress;
 	auto _DllMain = reinterpret_cast<f_DLL_ENTRY_POINT>(pBase + pOpt->AddressOfEntryPoint);
 
-	BYTE * LocationDelta = pBase - pOpt->ImageBase;
+	//Relocation process(only needed if not allocated at imageBase)
+	BYTE * LocationDelta = pBase - pOpt->ImageBase; //if 0: no need to relocate
 	if(LocationDelta)
 	{
 		if (!pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size)
-			return;
+			return; //data can not be relocated: no data
+		//Grab first image_base_relocation entry
 		auto * pRelocData = reinterpret_cast<IMAGE_BASE_RELOCATION*>(pBase + pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
 		while (pRelocData->VirtualAddress)
 		{
 			UINT AmountOfEntries = (pRelocData->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+			//Grab pointer to current relative info array
 			WORD * pRelativeInfo = reinterpret_cast<WORD*>(pRelocData + 1);
+			//Relocate the image
 			for(UINT i = 0; i != AmountOfEntries; ++i, ++pRelativeInfo)
 			{
 				if(RELOC_FLAG(*pRelativeInfo))
 				{
-					UINT_PTR * pPatch = reinterpret_cast<UINT_PTR*>(pBase + pRelocData->VirtualAddress + ((*pRelativeInfo) & 0xFFF));
+					//Set pointer to where to relocate to: Base + current relocationbloc + 12bits
+					UINT_PTR * pPatch = reinterpret_cast<UINT_PTR*>(pBase + pRelocData->VirtualAddress + ((*pRelativeInfo) & 0xFFF)); //0xFFF = LOW 12 bits of relocationinfo
+					//Add delta to the value in pPatch
 					*pPatch += reinterpret_cast<UINT_PTR>(LocationDelta);
 				}
 			}
@@ -205,27 +223,30 @@ void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData)
 		}
 	}
 
-	//Import section
-	if(pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size)
+	//================Import section================
+	if(pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size) // is there data?
 	{
 		auto * pImportDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(pBase + pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
-		while (pImportDesc->Name)
+		while (pImportDesc->Name)//loop through descriptor with name
 		{
-			char * szMod = reinterpret_cast<char*>(pBase + pImportDesc->Name);
+			char * szMod = reinterpret_cast<char*>(pBase + pImportDesc->Name); //Name of current module we are loading
+			//Load import
 			HINSTANCE hDll = _LoadLibraryA(szMod);
 			ULONG_PTR * pThunkRef = reinterpret_cast<ULONG_PTR*>(pBase + pImportDesc->OriginalFirstThunk);
 			ULONG_PTR * pFuncRef = reinterpret_cast<ULONG_PTR*>(pBase + pImportDesc->FirstThunk);
 
+			//If original thunkref undefined, use firstthunk
 			if (!pThunkRef)
 				pThunkRef = pFuncRef;
 
-			for (; *pThunkRef; ++pThunkRef, ++pFuncRef)
+			for (; *pThunkRef; ++pThunkRef, ++pFuncRef) //while pThunkRef is defined
 			{
-				if(IMAGE_SNAP_BY_ORDINAL(*pThunkRef))
+				//2 ways for the input to be stored: by functionname or by ordinal number
+				if(IMAGE_SNAP_BY_ORDINAL(*pThunkRef)) //import by ordinal number
 				{
-					*pFuncRef = _GetProcAddress(hDll, reinterpret_cast<char*>(*pThunkRef & 0xFFFF));
+					*pFuncRef = _GetProcAddress(hDll, reinterpret_cast<char*>(*pThunkRef & 0xFFFF)); // to avoid any warnings we take the low 2 bytes
 				}
-				else
+				else //import by name
 				{
 					auto * pImport = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(pBase + (*pThunkRef));
 					*pFuncRef = _GetProcAddress(hDll, pImport->Name);
@@ -234,11 +255,12 @@ void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData)
 			++pImportDesc;
 		}
 	}
+	//================Import done================
 	//Call the local storage callbacks
 	if(pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size)
 	{
 		auto * pTLS = reinterpret_cast<IMAGE_TLS_DIRECTORY*>(pBase + pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
-		auto * pCallback = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(pTLS->AddressOfCallBacks);
+		auto * pCallback = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(pTLS->AddressOfCallBacks); //The actual callbacks
 		for(; pCallback && *pCallback; ++pCallback) //while pCallback and *pCallback actually point to a callback
 		{
 			(*pCallback)(pBase, DLL_PROCESS_ATTACH, nullptr);
